@@ -1,0 +1,7 @@
+build/
+.vscode/
+build.sh
+flash.sh
+*.bin
+*.elf
+*.o
