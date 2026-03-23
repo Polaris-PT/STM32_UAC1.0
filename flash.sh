@@ -1,0 +1,1 @@
+openocd -f interface/daplink.cfg -f target/stm32h7x.cfg -c "program build/uac_test.elf" 

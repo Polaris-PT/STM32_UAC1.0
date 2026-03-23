@@ -19,8 +19,6 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
-#include <stdint.h>
-#include <string.h>
 #include "usbd_audio_if.h"
 
 /* USER CODE BEGIN INCLUDE */
@@ -36,7 +34,6 @@
 
 extern SAI_HandleTypeDef hsai_BlockA1;
 
-static void AUDIO_FillHalfTxBuffer_FS(uint32_t dst_word_offset);
 static void AUDIO_StartSaiIfNeeded_FS(void);
 
 /* 半传输完成回调：DMA 刚刚完成半区0的传输，接下来将读取半区1 -> 半区0安全可写 */
@@ -66,28 +63,19 @@ void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai)
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 
-/* PCM16 stereo (4 bytes/frame) 环形 FIFO，单位字节 */
-static uint8_t usb_pcm_ring[AUDIO_TOTAL_BUF_SIZE] __attribute__((aligned(32)));
-static volatile uint32_t usb_pcm_wr = 0U;
-static volatile uint32_t usb_pcm_rd = 0U;
-static volatile uint32_t usb_pcm_level = 0U; /* 当前 FIFO 内有效字节数 */
-
-/* SAI DMA 播放缓冲：每个 16bit 样本扩展为 32bit（左对齐），故 word 数 = AUDIO_TOTAL_BUF_SIZE/2 */
+/* 单一 DMA 播放缓冲：双半区 Ping-Pong（每个 16bit 样本扩展为 32bit 左对齐） */
 static int32_t sai_tx_buf[AUDIO_TOTAL_BUF_SIZE / 2] __attribute__((aligned(32)));
 static volatile uint8_t sai_started = 0U;
+static volatile uint8_t dma_ready_mask = 0U; /* bit0: half0 ready, bit1: half1 ready */
+static volatile uint32_t fill_word_pos = 0U; /* [0, SAI_TX_WORDS_TOTAL) */
 
 #define PCM_BYTES_PER_FRAME 4U /* L16 + R16 */
 #define SAI_WORDS_PER_FRAME 2U /* L32 + R32 */
 #define SAI_TX_WORDS_TOTAL ((uint32_t)(AUDIO_TOTAL_BUF_SIZE / 2U))
 #define SAI_TX_WORDS_HALF (SAI_TX_WORDS_TOTAL / 2U)
-#define SAI_TX_FRAMES_HALF (SAI_TX_WORDS_HALF / SAI_WORDS_PER_FRAME)
-#define USB_BYTES_PER_HALF (SAI_TX_FRAMES_HALF * PCM_BYTES_PER_FRAME)
-#define AUDIO_START_LEVEL_BYTES (USB_BYTES_PER_HALF)
-
-static inline uint32_t AUDIO_ClampU32(uint32_t value, uint32_t max)
-{
-  return (value > max) ? max : value;
-}
+#define DMA_HALF0_READY_BIT 0x01U
+#define DMA_HALF1_READY_BIT 0x02U
+#define DMA_BOTH_READY_MASK (DMA_HALF0_READY_BIT | DMA_HALF1_READY_BIT)
 
 static inline void AUDIO_LockIRQ(uint32_t *primask)
 {
@@ -101,25 +89,6 @@ static inline void AUDIO_UnlockIRQ(uint32_t primask)
   {
     __enable_irq();
   }
-}
-
-static inline uint16_t AUDIO_ReadU16LERing(const uint8_t *ring, uint32_t cap, uint32_t pos)
-{
-  uint8_t lo = ring[pos];
-  uint8_t hi = ring[(pos + 1U < cap) ? (pos + 1U) : 0U];
-  return (uint16_t)lo | ((uint16_t)hi << 8);
-}
-
-static inline void AUDIO_AdvanceRingPos(uint32_t cap, uint32_t *pos, uint32_t inc)
-{
-  if (cap == 0U)
-    return;
-  uint32_t next = *pos + (inc % cap);
-  if (next >= cap)
-  {
-    next -= cap;
-  }
-  *pos = next;
 }
 
 static inline int32_t AUDIO_PCM16_To_SAI32(int16_t sample)
@@ -254,10 +223,9 @@ static int8_t AUDIO_Init_FS(uint32_t AudioFreq, uint32_t Volume, uint32_t option
 
   uint32_t primask;
   AUDIO_LockIRQ(&primask);
-  usb_pcm_wr = 0U;
-  usb_pcm_rd = 0U;
-  usb_pcm_level = 0U;
   sai_started = 0U;
+  dma_ready_mask = 0U;
+  fill_word_pos = 0U;
   AUDIO_UnlockIRQ(primask);
 
   (void)memset((void *)sai_tx_buf, 0, sizeof(sai_tx_buf));
@@ -278,9 +246,8 @@ static int8_t AUDIO_DeInit_FS(uint32_t options)
   uint32_t primask;
   AUDIO_LockIRQ(&primask);
   sai_started = 0U;
-  usb_pcm_wr = 0U;
-  usb_pcm_rd = 0U;
-  usb_pcm_level = 0U;
+  dma_ready_mask = 0U;
+  fill_word_pos = 0U;
   AUDIO_UnlockIRQ(primask);
 
   if (HAL_SAI_GetState(&hsai_BlockA1) != HAL_SAI_STATE_RESET)
@@ -317,9 +284,18 @@ static int8_t AUDIO_AudioCmd_FS(uint8_t *pbuf, uint32_t size, uint8_t cmd)
     break;
 
   case AUDIO_CMD_STOP:
+  {
+    uint32_t primask;
+    AUDIO_LockIRQ(&primask);
     sai_started = 0U;
+    dma_ready_mask = 0U;
+    fill_word_pos = 0U;
+    AUDIO_UnlockIRQ(primask);
+
+    (void)memset((void *)sai_tx_buf, 0, sizeof(sai_tx_buf));
     (void)HAL_SAI_DMAStop(&hsai_BlockA1);
     break;
+  }
 
   default:
     break;
@@ -366,19 +342,10 @@ static int8_t AUDIO_PeriodicTC_FS(uint8_t *pbuf, uint32_t size, uint8_t cmd)
   if (cmd != AUDIO_OUT_TC)
     return USBD_OK;
 
-  /* 将 USB 收到的 PCM16 数据写入应用层 FIFO（可覆盖最老数据以避免阻塞） */
+  /* USB 包直接写入 DMA 缓冲（无额外应用层 FIFO） */
   if ((pbuf == NULL) || (size == 0U))
   {
     return USBD_OK;
-  }
-
-  const uint32_t cap = (uint32_t)sizeof(usb_pcm_ring);
-
-  /* 异常包长保护：仅保留最近 cap 字节 */
-  if (size > cap)
-  {
-    pbuf += (size - cap);
-    size = cap;
   }
 
   /* 防止半个采样帧进入 FIFO，避免左右声道错位 */
@@ -388,53 +355,63 @@ static int8_t AUDIO_PeriodicTC_FS(uint8_t *pbuf, uint32_t size, uint8_t cmd)
     return USBD_OK;
   }
 
-  uint32_t wr;
-  uint32_t level;
-  uint32_t primask;
+  uint32_t frames_left = size / PCM_BYTES_PER_FRAME;
+  const uint8_t *src = pbuf;
 
-  AUDIO_LockIRQ(&primask);
-  wr = usb_pcm_wr;
-  level = usb_pcm_level;
-  AUDIO_UnlockIRQ(primask);
-
-  uint32_t copy1 = size;
-  if (wr + copy1 > cap)
+  while (frames_left > 0U)
   {
-    copy1 = cap - wr;
-  }
-
-  (void)memcpy(&usb_pcm_ring[wr], pbuf, copy1);
-  if (size > copy1)
-  {
-    (void)memcpy(&usb_pcm_ring[0], &pbuf[copy1], size - copy1);
-  }
-
-  uint32_t new_wr = wr;
-  AUDIO_AdvanceRingPos(cap, &new_wr, size);
-
-  uint32_t new_level = level + size;
-  new_level = AUDIO_ClampU32(new_level, cap);
-
-  /* 若溢出，丢弃最老数据（推进 rd） */
-  if (level + size > cap)
-  {
-    uint32_t overflow = (level + size) - cap;
-    uint32_t rd;
-    AUDIO_LockIRQ(&primask);
-    rd = usb_pcm_rd;
-    AUDIO_UnlockIRQ(primask);
-
-    AUDIO_AdvanceRingPos(cap, &rd, overflow);
+    uint32_t pos;
+    uint8_t half;
+    uint8_t half_busy;
+    uint32_t primask;
 
     AUDIO_LockIRQ(&primask);
-    usb_pcm_rd = rd;
+    pos = fill_word_pos;
+    half = (pos < SAI_TX_WORDS_HALF) ? 0U : 1U;
+    half_busy = ((dma_ready_mask & (half == 0U ? DMA_HALF0_READY_BIT : DMA_HALF1_READY_BIT)) != 0U) ? 1U : 0U;
+    AUDIO_UnlockIRQ(primask);
+
+    /* 生产者追上消费者：直接丢弃本包剩余数据，保持逻辑简单 */
+    if (half_busy != 0U)
+    {
+      break;
+    }
+
+    uint32_t pos_in_half = (half == 0U) ? pos : (pos - SAI_TX_WORDS_HALF);
+    uint32_t free_words = SAI_TX_WORDS_HALF - pos_in_half;
+    uint32_t free_frames = free_words / SAI_WORDS_PER_FRAME;
+    uint32_t n = (frames_left < free_frames) ? frames_left : free_frames;
+
+    int32_t *dst = &sai_tx_buf[pos];
+    for (uint32_t i = 0U; i < n; i++)
+    {
+      uint16_t l16 = (uint16_t)src[0] | ((uint16_t)src[1] << 8);
+      uint16_t r16 = (uint16_t)src[2] | ((uint16_t)src[3] << 8);
+      *dst++ = AUDIO_PCM16_To_SAI32((int16_t)l16);
+      *dst++ = AUDIO_PCM16_To_SAI32((int16_t)r16);
+      src += PCM_BYTES_PER_FRAME;
+    }
+
+    frames_left -= n;
+    pos += n * SAI_WORDS_PER_FRAME;
+
+    AUDIO_LockIRQ(&primask);
+    fill_word_pos = pos;
+    if ((half == 0U) && (fill_word_pos >= SAI_TX_WORDS_HALF))
+    {
+      dma_ready_mask |= DMA_HALF0_READY_BIT;
+    }
+    else if ((half == 1U) && (fill_word_pos >= SAI_TX_WORDS_TOTAL))
+    {
+      dma_ready_mask |= DMA_HALF1_READY_BIT;
+      fill_word_pos = 0U;
+    }
     AUDIO_UnlockIRQ(primask);
   }
 
-  AUDIO_LockIRQ(&primask);
-  usb_pcm_wr = new_wr;
-  usb_pcm_level = new_level;
-  AUDIO_UnlockIRQ(primask);
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+  SCB_CleanDCache_by_Addr((uint32_t *)sai_tx_buf, (int32_t)sizeof(sai_tx_buf));
+#endif
 
   /* 某些主机/栈流程下 CMD_START 可能没有可靠触发，这里做数据到达后的保底启动 */
   AUDIO_StartSaiIfNeeded_FS();
@@ -461,10 +438,13 @@ static int8_t AUDIO_GetState_FS(void)
 void TransferComplete_CallBack_FS(void)
 {
   /* USER CODE BEGIN 7 */
-  /* DMA 刚播放完后半区，后半区安全可写 */
+  /* DMA 刚播放完后半区，释放后半区给 USB 生产者 */
   if (sai_started != 0U)
   {
-    AUDIO_FillHalfTxBuffer_FS(SAI_TX_WORDS_HALF);
+    uint32_t primask;
+    AUDIO_LockIRQ(&primask);
+    dma_ready_mask &= (uint8_t)(~DMA_HALF1_READY_BIT);
+    AUDIO_UnlockIRQ(primask);
   }
   /* USER CODE END 7 */
 }
@@ -476,10 +456,13 @@ void TransferComplete_CallBack_FS(void)
 void HalfTransfer_CallBack_FS(void)
 {
   /* USER CODE BEGIN 8 */
-  /* DMA 刚播放完前半区，前半区安全可写 */
+  /* DMA 刚播放完前半区，释放前半区给 USB 生产者 */
   if (sai_started != 0U)
   {
-    AUDIO_FillHalfTxBuffer_FS(0U);
+    uint32_t primask;
+    AUDIO_LockIRQ(&primask);
+    dma_ready_mask &= (uint8_t)(~DMA_HALF0_READY_BIT);
+    AUDIO_UnlockIRQ(primask);
   }
   /* USER CODE END 8 */
 }
@@ -489,7 +472,7 @@ void HalfTransfer_CallBack_FS(void)
 static void AUDIO_StartSaiIfNeeded_FS(void)
 {
   uint32_t primask;
-  uint32_t level;
+  uint8_t ready_mask;
 
   if (sai_started != 0U)
   {
@@ -502,19 +485,14 @@ static void AUDIO_StartSaiIfNeeded_FS(void)
   }
 
   AUDIO_LockIRQ(&primask);
-  level = usb_pcm_level;
+  ready_mask = dma_ready_mask;
   AUDIO_UnlockIRQ(primask);
 
-  /* 至少积累半缓冲数据后再开播，降低启动即欠载导致长时间静音 */
-  if (level < AUDIO_START_LEVEL_BYTES)
+  /* 两个半区都准备好后再启动，避免开播即欠载 */
+  if ((ready_mask & DMA_BOTH_READY_MASK) != DMA_BOTH_READY_MASK)
   {
     return;
   }
-
-  /* 启动前先预填两半区，避免开播首周期完全静音 */
-  (void)memset((void *)sai_tx_buf, 0, sizeof(sai_tx_buf));
-  AUDIO_FillHalfTxBuffer_FS(0U);
-  AUDIO_FillHalfTxBuffer_FS(SAI_TX_WORDS_HALF);
 
 #if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
   SCB_CleanDCache_by_Addr((uint32_t *)sai_tx_buf, (int32_t)sizeof(sai_tx_buf));
@@ -524,86 +502,6 @@ static void AUDIO_StartSaiIfNeeded_FS(void)
   {
     sai_started = 1U;
   }
-}
-
-static void AUDIO_FillHalfTxBuffer_FS(uint32_t dst_word_offset)
-{
-  const uint32_t cap = (uint32_t)sizeof(usb_pcm_ring);
-  uint32_t rd;
-  uint32_t level;
-  uint32_t primask;
-
-  AUDIO_LockIRQ(&primask);
-  rd = usb_pcm_rd;
-  level = usb_pcm_level;
-  AUDIO_UnlockIRQ(primask);
-
-  /* 水位判定：接近空则插1帧(少消耗)，接近满则丢1帧(多消耗) */
-  int32_t slip = 0;
-  if (level < (uint32_t)AUDIO_OUT_PACKET)
-  {
-    slip = -1;
-  }
-  else if (level > (cap - (uint32_t)AUDIO_OUT_PACKET))
-  {
-    slip = 1;
-  }
-
-  const uint32_t slip_index = SAI_TX_FRAMES_HALF / 2U;
-  int32_t *dst = &sai_tx_buf[dst_word_offset];
-  int32_t last_l = 0;
-  int32_t last_r = 0;
-
-  for (uint32_t i = 0; i < SAI_TX_FRAMES_HALF; i++)
-  {
-    /* 插帧：在中点重复上一帧（不消耗 FIFO） */
-    if ((slip < 0) && (i == slip_index) && (i != 0U))
-    {
-      *dst++ = last_l;
-      *dst++ = last_r;
-      continue;
-    }
-
-    if (level < PCM_BYTES_PER_FRAME)
-    {
-      /* 欠载：填静音 */
-      last_l = 0;
-      last_r = 0;
-      *dst++ = 0;
-      *dst++ = 0;
-      continue;
-    }
-
-    uint16_t l16 = AUDIO_ReadU16LERing(usb_pcm_ring, cap, rd);
-    uint32_t rd_r = rd;
-    AUDIO_AdvanceRingPos(cap, &rd_r, 2U);
-    uint16_t r16 = AUDIO_ReadU16LERing(usb_pcm_ring, cap, rd_r);
-
-    last_l = AUDIO_PCM16_To_SAI32((int16_t)l16);
-    last_r = AUDIO_PCM16_To_SAI32((int16_t)r16);
-    *dst++ = last_l;
-    *dst++ = last_r;
-
-    AUDIO_AdvanceRingPos(cap, &rd, PCM_BYTES_PER_FRAME);
-    level -= PCM_BYTES_PER_FRAME;
-
-    /* 丢帧：在中点额外消耗 1 帧（不输出） */
-    if ((slip > 0) && (i == slip_index) && (level >= PCM_BYTES_PER_FRAME))
-    {
-      AUDIO_AdvanceRingPos(cap, &rd, PCM_BYTES_PER_FRAME);
-      level -= PCM_BYTES_PER_FRAME;
-    }
-  }
-
-  AUDIO_LockIRQ(&primask);
-  usb_pcm_rd = rd;
-  usb_pcm_level = level;
-  AUDIO_UnlockIRQ(primask);
-
-#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
-  /* 若启用DCache，保证 DMA 可见最新数据 */
-  SCB_CleanDCache_by_Addr((uint32_t *)&sai_tx_buf[dst_word_offset], (int32_t)(SAI_TX_WORDS_HALF * sizeof(int32_t)));
-#endif
 }
 
 /* USER CODE END PRIVATE_FUNCTIONS_IMPLEMENTATION */
