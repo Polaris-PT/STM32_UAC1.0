@@ -1,1 +1,1 @@
-openocd -f interface/daplink.cfg -f target/stm32h7x.cfg -c "program build/uac_test.elf" 
+openocd -f interface/cmsis-dap.cfg -f target/stm32h7x.cfg -c "program build/uac_test.elf verify reset exit" 

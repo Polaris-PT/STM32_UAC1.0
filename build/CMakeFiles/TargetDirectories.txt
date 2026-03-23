@@ -1,0 +1,7 @@
+/home/potato/code/c_cpp/uac_test/build/CMakeFiles/uac_test.dir
+/home/potato/code/c_cpp/uac_test/build/CMakeFiles/edit_cache.dir
+/home/potato/code/c_cpp/uac_test/build/CMakeFiles/rebuild_cache.dir
+/home/potato/code/c_cpp/uac_test/build/cmake/stm32cubemx/CMakeFiles/STM32_Drivers.dir
+/home/potato/code/c_cpp/uac_test/build/cmake/stm32cubemx/CMakeFiles/USB_Device_Library.dir
+/home/potato/code/c_cpp/uac_test/build/cmake/stm32cubemx/CMakeFiles/edit_cache.dir
+/home/potato/code/c_cpp/uac_test/build/cmake/stm32cubemx/CMakeFiles/rebuild_cache.dir

@@ -94,13 +94,13 @@
 				"command": "openocd",
 				"args": [
 					"-f",
-					"interface/stlink.cfg",
+					"cmsis-dap.cfg",
 					"-f",
-					"target/stm32f4x.cfg",
+					"target/stm32h7x.cfg",
 					//"-c",
 					//"transport select swd",
 					"-c",
-					"program ./build/F401CCU6.elf verify reset exit"
+					"program ./build/uac_test.elf verify reset exit"
 				],
 				"group": {
 					"kind": "build",
